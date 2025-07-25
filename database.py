@@ -39,16 +39,18 @@ def create_database():
             );
         """)
  
-        # Таблица слов
+        # Таблица слов (добавляем user_id)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS words(
             id SERIAL PRIMARY KEY,
-            russian_word VARCHAR(50) UNIQUE NOT NULL,
+            russian_word VARCHAR(50) NOT NULL, 
             target_word VARCHAR(50) NOT NULL,
             other_word_1 VARCHAR(50) NOT NULL,
             other_word_2 VARCHAR(50) NOT NULL,
             other_word_3 VARCHAR(50) NOT NULL,
-            added_at TIMESTAMP DEFAULT NOW()
+            user_id BIGINT,  
+            added_at TIMESTAMP DEFAULT NOW(),
+            CONSTRAINT unique_word_per_user UNIQUE (russian_word, user_id)
             );
         """)
  
@@ -195,10 +197,13 @@ def add_user_if_not_exists(user_id: int, username: str):
         
         conn.commit()
     conn.close()
- 
+
+
 def get_random_user_word(user_id: int):
     """
-    Функция возвращает случайное невыученное слово
+    Возвращает случайное слово для пользователя:
+    - либо из его личных слов,
+    - либо из общих (user_id IS NULL), если он их не удалял.
     """
     conn = psycopg2.connect(**DB_CONFIG)
     with conn.cursor() as cur:
@@ -208,11 +213,17 @@ def get_random_user_word(user_id: int):
             FROM words w
             JOIN user_word uw ON w.id = uw.words_id
             WHERE uw.user_id = %s
+            AND (uw.user_id = %s OR uw.user_id IS NULL)
+            AND NOT EXISTS (  
+                SELECT 1 FROM deleted_words dw 
+                WHERE dw.user_id = %s AND dw.words_id = w.id
+            )
             ORDER BY RANDOM()
             LIMIT 1;
-        """, (user_id,))
+        """, (user_id, user_id, user_id))
         return cur.fetchone()
     conn.close()
+
  
 def remove_user_word(user_id: int, word_id: int):
     """
@@ -246,53 +257,30 @@ def remove_user_word(user_id: int, word_id: int):
 
 def add_custom_word(user_id: int, russian: str, target: str, wrong1: str, wrong2: str, wrong3: str):
     """
-    Функция для добавления пользователем своих слов
+    Добавляет слово, которое будет доступно только этому пользователю.
     """
     conn = psycopg2.connect(**DB_CONFIG)
     with conn.cursor() as cur:
         try:
-            # Проверяем, не удалял ли пользователь это слово ранее
+            # Пытаемся добавить слово с привязкой к пользователю
             cur.execute("""
-                DELETE FROM deleted_words
-                WHERE user_id = %s AND words_id = (
-                    SELECT id FROM words WHERE russian_word = %s
-                )
-                RETURNING 1;
-            """, (user_id, russian))
-            
-            if cur.fetchone():  # Если слово было удалено этим пользователем
-                # Добавляем связь пользователь-слово
-                cur.execute("""
-                    INSERT INTO user_word (user_id, words_id)
-                    VALUES (%s, (SELECT id FROM words WHERE russian_word = %s))
-                    ON CONFLICT (user_id, words_id) DO NOTHING;
-                """, (user_id, russian))
-                conn.commit()
-                return True
-            
-            # Если слово не было удалено, добавляем как новое
-            cur.execute("""
-                INSERT INTO words (russian_word, target_word, other_word_1, other_word_2, other_word_3)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (russian_word) DO NOTHING
+                INSERT INTO words (russian_word, target_word, other_word_1, other_word_2, other_word_3, user_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (russian_word, user_id) DO NOTHING
                 RETURNING id;
-            """, (russian, target, wrong1, wrong2, wrong3))
+            """, (russian, target, wrong1, wrong2, wrong3, user_id))
             
-            result = cur.fetchone()
-            if not result:  # Если слово уже существует в базе
-                # Просто связываем с пользователем
-                cur.execute("""
-                    INSERT INTO user_word (user_id, words_id)
-                    VALUES (%s, (SELECT id FROM words WHERE russian_word = %s))
-                    ON CONFLICT (user_id, words_id) DO NOTHING;
-                """, (user_id, russian))
-            else:
-                word_id = result[0]
-                cur.execute("""
-                    INSERT INTO user_word (user_id, words_id)
-                    VALUES (%s, %s)
-                    ON CONFLICT (user_id, words_id) DO NOTHING;
-                """, (user_id, word_id))
+            word_id = cur.fetchone()
+            if not word_id:  # Если слово уже есть у этого пользователя
+                conn.rollback()
+                return False
+            
+            # Связываем слово с пользователем (добавляем в user_word)
+            cur.execute("""
+                INSERT INTO user_word (user_id, words_id)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id, words_id) DO NOTHING;
+            """, (user_id, word_id[0]))
             
             conn.commit()
             return True

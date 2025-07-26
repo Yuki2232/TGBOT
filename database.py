@@ -29,6 +29,30 @@ def create_database():
     """
     conn = psycopg2.connect(**DB_CONFIG)
     with conn.cursor() as cur:
+        cur.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name='words' AND column_name='user_id'
+        """)
+        if not cur.fetchone():
+            # Добавляем столбец если его нет
+            cur.execute("ALTER TABLE words ADD COLUMN user_id BIGINT;")
+            conn.commit()
+        
+        # Проверяем существование ограничения
+        cur.execute("""
+            SELECT constraint_name 
+            FROM information_schema.table_constraints 
+            WHERE table_name='words' AND constraint_name='unique_word_per_user'
+        """)
+        if not cur.fetchone():
+            # Добавляем ограничение если его нет
+            cur.execute("""
+                ALTER TABLE words 
+                ADD CONSTRAINT unique_word_per_user 
+                UNIQUE (russian_word, user_id);
+            """)
+            conn.commit()
         # Таблица пользователей
         cur.execute("""
             CREATE TABLE IF NOT EXISTS users(
@@ -162,12 +186,9 @@ def create_database():
     conn.close()
  
 def add_user_if_not_exists(user_id: int, username: str):
-    """
-    Функция добавляет пользователя и связывает его только с новыми словами
-    """
     conn = psycopg2.connect(**DB_CONFIG)
     with conn.cursor() as cur:
-        # Добавляем/обновляем пользователя, если у него например изменилось имя
+        # 1. Добавляем/обновляем пользователя
         cur.execute("""
             INSERT INTO users (id, name)
             VALUES (%s, %s)
@@ -175,24 +196,20 @@ def add_user_if_not_exists(user_id: int, username: str):
             SET name = EXCLUDED.name,
                 last_active = NOW();
         """, (user_id, username))
- 
-        # Добавляем только новые слова, которые пользователь еще не удалял (для новых добавляется вся база)
         cur.execute("""
             INSERT INTO user_word (user_id, words_id)
             SELECT %s, w.id
             FROM words w
-            WHERE NOT EXISTS (
-                SELECT 1 FROM user_word uw 
-                WHERE uw.user_id = %s AND uw.words_id = w.id
-            )
-            AND NOT EXISTS (
-                SELECT 1 FROM deleted_words dw
-                WHERE dw.user_id = %s AND dw.words_id = w.id
-            )
-            AND w.added_at > COALESCE(
-                (SELECT MAX(uw.added_at) FROM user_word uw WHERE uw.user_id = %s),
-                '1970-01-01'::timestamp
-            )
+            WHERE 
+                (w.user_id IS NULL OR w.user_id = %s)
+                AND NOT EXISTS (
+                    SELECT 1 FROM user_word uw 
+                    WHERE uw.user_id = %s AND uw.words_id = w.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM deleted_words dw
+                    WHERE dw.user_id = %s AND dw.words_id = w.id
+                )
         """, (user_id, user_id, user_id, user_id))
         
         conn.commit()
@@ -200,11 +217,6 @@ def add_user_if_not_exists(user_id: int, username: str):
 
 
 def get_random_user_word(user_id: int):
-    """
-    Возвращает случайное слово для пользователя:
-    - либо из его личных слов,
-    - либо из общих (user_id IS NULL), если он их не удалял.
-    """
     conn = psycopg2.connect(**DB_CONFIG)
     with conn.cursor() as cur:
         cur.execute("""
@@ -255,7 +267,7 @@ def remove_user_word(user_id: int, word_id: int):
         conn.close()
 
 
-def add_custom_word(user_id: int, russian: str, target: str, wrong1: str, wrong2: str, wrong3: str):
+def add_custom_word(user_id: int, russian: str, target_word: str, wrong1: str, wrong2: str, wrong3: str):
     """
     Добавляет слово, которое будет доступно только этому пользователю.
     """
@@ -268,14 +280,14 @@ def add_custom_word(user_id: int, russian: str, target: str, wrong1: str, wrong2
                 VALUES (%s, %s, %s, %s, %s, %s)
                 ON CONFLICT (russian_word, user_id) DO NOTHING
                 RETURNING id;
-            """, (russian, target, wrong1, wrong2, wrong3, user_id))
+            """, (russian, target_word, wrong1, wrong2, wrong3, user_id))
             
             word_id = cur.fetchone()
             if not word_id:  # Если слово уже есть у этого пользователя
                 conn.rollback()
                 return False
             
-            # Связываем слово с пользователем (добавляем в user_word)
+            # Связываем слово с пользователем
             cur.execute("""
                 INSERT INTO user_word (user_id, words_id)
                 VALUES (%s, %s)
